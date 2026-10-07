@@ -71,11 +71,65 @@ Missing keys fail at `caddy validate` time, not during certificate issuance.
 
 ### Requirements
 
-- A RAM user with least privilege. For ESA: `esa:ListSites`, `esa:CreateRecord`,
-  `esa:DeleteRecord`, `esa:ListRecords`.
 - **ESA sites must be onboarded in NS mode.** CNAME-mode sites reject TXT
   records (`InvalidParameter.CnameSiteRecordUnsupport`), so DNS-01 cannot work.
   Classic AliDNS has no such restriction.
+- A RAM user with least-privilege permissions — see below.
+
+## RAM permissions
+
+The two providers call different APIs and need **different** policies. Each ships
+as a ready-to-paste custom RAM policy, in its own file because they are not
+interchangeable:
+
+| File | For | Covers |
+| --- | --- | --- |
+| [`ram-policy-esa.json`](ram-policy-esa.json) | `dns esa` — 边缘安全加速 | 4 actions, `esa:*` |
+| [`ram-policy-alidns.json`](ram-policy-alidns.json) | `dns alidns` — 云解析 DNS | 4 actions, `alidns:*` |
+
+Attach to a dedicated RAM user: RAM console → Users → the user → Permissions →
+Add permission → Create custom policy, then paste the JSON. Do **not** use the
+`AliyunESAFullAccess` / `AliyunDNSFullAccess` managed policies; they are far
+wider than a certificate renewal needs.
+
+Replace the `*` in `Resource` with your account ID to scope further, e.g.
+`acs:esa:cn-hangzhou:1234567890123456:site/*`. Note the AliDNS ARN has an
+**empty region segment** (`acs:alidns::1234567890123456:domain/example.com`) —
+that is correct, and `acs:alidns:*:...` will not match.
+
+### `dns esa` — ESA
+
+| Action | Level | Resource | Why |
+| --- | --- | --- | --- |
+| `esa:ListSites` | list | `*` | Resolves the ACME zone to a site ID. Cached per zone. |
+| `esa:ListRecords` | get | `acs:esa:{region}:{account}:site/{SiteId}` | Finds the challenge record before deleting it; ESA has no delete-by-value API. |
+| `esa:CreateRecord` | create | `acs:esa:{region}:{account}:site/{SiteId}` | Publishes `_acme-challenge.<domain>` TXT. |
+| `esa:DeleteRecord` | delete | `*` | Removes the TXT after validation. |
+
+`ListSites` and `DeleteRecord` **cannot** be resource-scoped: the former is a
+list call with no site in scope, the latter takes only a `RecordId` with no site
+or domain. That is an API limitation, not a shortcut — this is already the
+narrowest policy the API permits. Everything that can be scoped is.
+
+### `dns alidns` — 云解析 DNS
+
+| Action | Level | Resource | Why |
+| --- | --- | --- | --- |
+| `alidns:AddDomainRecord` | create | `acs:alidns::{account}:domain/{domain}` | Publishes the TXT. |
+| `alidns:DeleteDomainRecord` | delete | `acs:alidns::{account}:domain/{domain}` | Removes it after validation. |
+| `alidns:DescribeDomainRecords` | get | `acs:alidns::{account}:domain/{domain}` | Record lookup when deleting. |
+| `alidns:UpdateDomainRecord` | update | `acs:alidns::{account}:domain/{domain}` | Only `SetRecords`. |
+
+`UpdateDomainRecord` is in its own statement because it is the one action you
+can plausibly drop: certificate renewal only calls `AppendRecords` and
+`DeleteRecords`. Remove it if you never use Caddy's global `dns { }` block or
+ECH, which are the only callers of `SetRecords`. Keep
+`DescribeDomainRecords` — it is read-only, and dropping it breaks the delete
+fallback that runs whenever a record ID does not survive the round trip.
+
+`alidns:DescribeDomains` and `alidns:DescribeDomainRecordInfo` exist in the
+underlying library but are never called on any code path, so they are absent
+from the policy.
 
 ## Build
 

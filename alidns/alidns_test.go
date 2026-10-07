@@ -1,6 +1,9 @@
 package alidns
 
 import (
+	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -272,5 +275,215 @@ func TestAliDNSValidateRequiresBothKeys(t *testing.T) {
 func TestAliDNSValidateNilProvider(t *testing.T) {
 	if err := (&Provider{}).Validate(); err == nil {
 		t.Error("Validate() on a nil embedded provider = nil, want error")
+	}
+}
+
+// ============================================================================
+// RAM policy files
+//
+// ram-policy-esa.json and ram-policy-alidns.json are pasted verbatim into the
+// RAM console, so a syntax error here surfaces to a user as an opaque rejection
+// rather than as a failed build. Cheap to keep honest.
+// ============================================================================
+
+type ramStatement struct {
+	Sid      string   `json:"Sid"`
+	Effect   string   `json:"Effect"`
+	Action   []string `json:"Action"`
+	Resource []string `json:"Resource"`
+}
+
+type ramPolicy struct {
+	Version   string         `json:"Version"`
+	Statement []ramStatement `json:"Statement"`
+}
+
+func loadRAMPolicy(t *testing.T, name string) ramPolicy {
+	t.Helper()
+	raw, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("reading %s: %v", name, err)
+	}
+	var p ramPolicy
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("%s is not valid JSON: %v", name, err)
+	}
+	if p.Version != "1" {
+		t.Errorf("%s: Version = %q, want \"1\"", name, p.Version)
+	}
+	if len(p.Statement) == 0 {
+		t.Fatalf("%s: no statements", name)
+	}
+	for i, s := range p.Statement {
+		if s.Effect != "Allow" {
+			t.Errorf("%s statement %d: Effect = %q, want Allow", name, i, s.Effect)
+		}
+		if s.Sid == "" {
+			t.Errorf("%s statement %d: missing Sid", name, i)
+		}
+		if len(s.Action) == 0 {
+			t.Errorf("%s statement %d (%s): no actions", name, i, s.Sid)
+		}
+		if len(s.Resource) == 0 {
+			t.Errorf("%s statement %d (%s): no resources", name, i, s.Sid)
+		}
+		for _, a := range s.Action {
+			if a == "*" {
+				t.Errorf("%s statement %d: bare \"*\" action grants everything", name, i)
+			}
+		}
+	}
+	return p
+}
+
+func ramActions(p ramPolicy) []string {
+	var out []string
+	for _, s := range p.Statement {
+		out = append(out, s.Action...)
+	}
+	return out
+}
+
+func ramResourceSet(p ramPolicy) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range p.Statement {
+		for _, r := range s.Resource {
+			if !seen[r] {
+				seen[r] = true
+				out = append(out, r)
+			}
+		}
+	}
+	return out
+}
+
+func TestRAMPolicyAliDNS(t *testing.T) {
+	p := loadRAMPolicy(t, "ram-policy-alidns.json")
+
+	got := ramActions(p)
+	want := []string{
+		"alidns:AddDomainRecord",
+		"alidns:DeleteDomainRecord",
+		"alidns:DescribeDomainRecords",
+		"alidns:UpdateDomainRecord",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("actions = %v, want exactly %v", got, want)
+	}
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("missing action %s", w)
+		}
+	}
+
+	// AliDNS ARNs have an empty region segment. Writing acs:alidns:*:... silently
+	// fails to match, so pin the shape here.
+	for _, r := range ramResourceSet(p) {
+		if !strings.HasPrefix(r, "acs:alidns::") {
+			t.Errorf("resource %q must start with \"acs:alidns::\" (empty region)", r)
+		}
+	}
+
+	// Never grant write access to the whole account.
+	for _, s := range p.Statement {
+		for _, r := range s.Resource {
+			if r == "*" {
+				t.Errorf("statement %s grants access to every resource", s.Sid)
+			}
+		}
+	}
+}
+
+func TestRAMPolicyESA(t *testing.T) {
+	p := loadRAMPolicy(t, "ram-policy-esa.json")
+
+	got := ramActions(p)
+	want := []string{
+		"esa:ListSites",
+		"esa:ListRecords",
+		"esa:CreateRecord",
+		"esa:DeleteRecord",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("actions = %v, want exactly %v", got, want)
+	}
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("missing action %s", w)
+		}
+	}
+
+	// The two actions that *can* be scoped must be.
+	scoped := map[string]bool{"esa:ListRecords": false, "esa:CreateRecord": false}
+	for _, s := range p.Statement {
+		for _, a := range s.Action {
+			if _, ok := scoped[a]; ok {
+				for _, r := range s.Resource {
+					if strings.HasPrefix(r, "acs:esa:") {
+						scoped[a] = true
+					}
+				}
+			}
+		}
+	}
+	for a, ok := range scoped {
+		if !ok {
+			t.Errorf("%s must be scoped to acs:esa:.../site/*, not \"*\"", a)
+		}
+	}
+
+	// ListSites and DeleteRecord take no site or domain in the request, so the
+	// API only supports "*" for them. Assert that is still the case rather than
+	// silently widening if Alibaba adds scoping.
+	known := map[string]bool{"esa:ListSites": true, "esa:ListRecords": true, "esa:CreateRecord": true, "esa:DeleteRecord": true}
+	for _, a := range ramActions(p) {
+		if !known[a] {
+			t.Errorf("unexpected action %q; if a new one is needed, document it in the README", a)
+		}
+	}
+}
+
+// The two policies must stay separate files: they target different services and
+// are attached to different RAM users. A combined file would grant whichever
+// service you did not intend to expose.
+func TestRAMPoliciesAreSeparateFiles(t *testing.T) {
+	esa := loadRAMPolicy(t, "ram-policy-esa.json")
+	alidns := loadRAMPolicy(t, "ram-policy-alidns.json")
+
+	for _, a := range ramActions(esa) {
+		if !strings.HasPrefix(a, "esa:") {
+			t.Errorf("ram-policy-esa.json contains non-ESA action %q", a)
+		}
+	}
+	for _, a := range ramActions(alidns) {
+		if !strings.HasPrefix(a, "alidns:") {
+			t.Errorf("ram-policy-alidns.json contains non-AliDNS action %q", a)
+		}
+	}
+}
+
+// The AliDNS action set must match what the library can actually call. These two
+// exist in the dependency but are unreachable, so granting them would be
+// needless privilege.
+func TestRAMPolicyOmitsUnreachableAliDNSActions(t *testing.T) {
+	p := loadRAMPolicy(t, "ram-policy-alidns.json")
+	for _, a := range ramActions(p) {
+		switch a {
+		case "alidns:DescribeDomains", "alidns:DescribeDomainRecordInfo":
+			t.Errorf("%s is never called by the provider; remove it", a)
+		}
 	}
 }

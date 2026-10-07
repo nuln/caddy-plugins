@@ -1,0 +1,36 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Sid": "ESADNSRecordLookup",
+      "Effect": "Allow",
+      "Action": [
+        "esa:ListSites"
+      ],
+      "Resource": [
+        "*"
+      ]
+    },
+    {
+      "Sid": "ESADNSRecordChallengeLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "esa:ListRecords",
+        "esa:CreateRecord"
+      ],
+      "Resource": [
+        "acs:esa:*:*:site/*"
+      ]
+    },
+    {
+      "Sid": "ESADNSRecordDelete",
+      "Effect": "Allow",
+      "Action": [
+        "esa:DeleteRecord"
+      ],
+      "Resource": [
+        "*"
+      ]
+    }
+  ]
+}

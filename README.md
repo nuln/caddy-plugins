@@ -8,6 +8,9 @@ Caddy DNS provider plugins, maintained together but released independently.
 | --- | --- | --- | --- |
 | [`alidns/`](alidns/) | `github.com/nuln/caddy-plugins/alidns` | `alidns/v*` | fork of [caddy-dns/alidns](https://github.com/caddy-dns/alidns) (MIT © 2020 Yu Zhu) |
 
+Least-privilege RAM policies ship with the plugin, one file per service — see
+[alidns/README.md](alidns/README.md#ram-permissions).
+
 ## Independent versioning
 
 Each plugin directory is its own Go module with its own `go.mod`, so versions

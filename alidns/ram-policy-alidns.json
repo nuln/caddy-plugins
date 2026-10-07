@@ -1,0 +1,27 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Sid": "AliDNSRecordChallengeLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "alidns:AddDomainRecord",
+        "alidns:DeleteDomainRecord",
+        "alidns:DescribeDomainRecords"
+      ],
+      "Resource": [
+        "acs:alidns::*:domain/*"
+      ]
+    },
+    {
+      "Sid": "AliDNSRecordUpdateForSetRecords",
+      "Effect": "Allow",
+      "Action": [
+        "alidns:UpdateDomainRecord"
+      ],
+      "Resource": [
+        "acs:alidns::*:domain/*"
+      ]
+    }
+  ]
+}

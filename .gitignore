@@ -1,7 +1,8 @@
-# xcaddy build output
+# xcaddy build output, at the repo root or inside any plugin directory
 /caddy
-/caddy-*
 caddy/
+**/caddy
+**/caddy-*
 
 # xcaddy scratch directories
 buildenv_*/
