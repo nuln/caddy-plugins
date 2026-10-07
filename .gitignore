@@ -1,0 +1,12 @@
+# xcaddy build output
+/caddy
+/caddy-*
+caddy/
+
+# xcaddy scratch directories
+buildenv_*/
+
+# CI scratch files
+coverage.out
+modules.txt
+bad.json

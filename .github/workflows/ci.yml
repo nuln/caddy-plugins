@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # Weekly, so a Caddy release that breaks a plugin shows up here instead of
+    # the next time somebody tries to build it.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Each plugin is its own module in its own subdirectory.
+  PLUGIN: alidns
+  PLUGIN_PATH: alidns
+
+jobs:
+  check:
+    name: Lint, vet and test (${{ env.PLUGIN }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.PLUGIN_PATH }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.PLUGIN_PATH }}/go.mod
+          cache-dependency-path: ${{ env.PLUGIN_PATH }}/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: go test
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: coverage floor
+        # Guards against a new untested branch, not a coverage contest.
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')"
+          echo "total coverage: ${total}%"
+          awk -v t="$total" 'BEGIN { if (t+0 < 85) { print "::error::coverage " t "% is below the 85% floor"; exit 1 } }'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ env.PLUGIN }}
+          path: ${{ env.PLUGIN_PATH }}/coverage.out
+          retention-days: 7
+
+  build-caddy:
+    name: Caddy build ${{ matrix.caddy || 'latest' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.PLUGIN_PATH }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Empty means "whatever xcaddy resolves as latest".
+        caddy: ['', 'v2.11.7']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.PLUGIN_PATH }}/go.mod
+
+      - name: Cache xcaddy and the Caddy build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin
+            ~/.cache/go-build
+          key: ${{ runner.os }}-xcaddy-${{ env.PLUGIN }}-${{ matrix.caddy }}-${{ hashFiles(format('{0}/go.mod', env.PLUGIN_PATH)) }}
+          restore-keys: ${{ runner.os }}-xcaddy-${{ env.PLUGIN }}-${{ matrix.caddy }}-
+
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      - name: Build Caddy with this plugin
+        # The module version is a placeholder: the local replace makes xcaddy
+        # build the checked-out tree instead of fetching it. A version is still
+        # required, otherwise xcaddy tries to `go get` the module from its
+        # remote, which fails for an un-published repository.
+        run: |
+          set -euxo pipefail
+          target=""
+          if [ -n "${{ matrix.caddy }}" ]; then
+            target="${{ matrix.caddy }}"
+          fi
+          xcaddy build ${target} \
+            --with "github.com/nuln/caddy-plugins/${{ env.PLUGIN }}@v0.0.0=${{ github.workspace }}/${{ env.PLUGIN_PATH }}" \
+            --output ./caddy
+
+      - name: Modules are registered
+        run: |
+          set -euo pipefail
+          ./caddy list-modules > modules.txt
+          cat modules.txt
+          for want in dns.providers.esa dns.providers.alidns; do
+            grep -qx "$want" modules.txt || {
+              echo "::error::$want is not registered"
+              exit 1
+            }
+          done
+          # The alias never shipped, so nothing can depend on it. Guard against
+          # someone "restoring" it for symmetry with the other providers.
+          if grep -qx 'dns.providers.aliesa' modules.txt; then
+            echo "::error::dns.providers.aliesa is registered but was never released"
+            exit 1
+          fi
+
+      - name: Show versions
+        run: ./caddy version
+
+      - name: A realistic Caddyfile loads
+        env:
+          ALIYUN_ACCESS_KEY_ID: test_ak
+          ALIYUN_ACCESS_KEY_SECRET: test_sk
+        run: |
+          set -euo pipefail
+          cat > Caddyfile <<'EOF'
+          {
+              acme_dns esa {
+                  access_key_id "{$ALIYUN_ACCESS_KEY_ID}"
+                  access_key_secret "{$ALIYUN_ACCESS_KEY_SECRET}"
+              }
+          }
+
+          *.example.com {
+              tls {
+                  dns alidns {
+                      access_key_id "{$ALIYUN_ACCESS_KEY_ID}"
+                      access_key_secret "{$ALIYUN_ACCESS_KEY_SECRET}"
+                  }
+              }
+              respond "ok"
+          }
+          EOF
+          ./caddy validate --config Caddyfile
+
+      - name: Incomplete credentials are rejected at load time
+        # A config that loads now and fails during certificate issuance a month
+        # later is the exact regression this guards.
+        #
+        # Output is captured rather than piped: `caddy validate` exits non-zero on
+        # an invalid config, so under `pipefail` a `caddy | grep` pipeline would
+        # report that exit code and hide the fact that grep actually matched.
+        run: |
+          set -euo pipefail
+          cat > bad.json <<'EOF'
+          {
+            "apps": {
+              "http": {},
+              "tls": {
+                "automation": {
+                  "policies": [{
+                    "subjects": ["example.com"],
+                    "issuers": [{
+                      "module": "acme",
+                      "challenges": {
+                        "dns": { "provider": { "name": "esa", "access_key_id": "only_ak" } }
+                      }
+                    }]
+                  }]
+                }
+              }
+            }
+          }
+          EOF
+          output="$(./caddy validate --config bad.json 2>&1 || true)"
+          echo "$output"
+          if ! grep -q 'access_key_id and access_key_secret' <<<"$output"; then
+            echo "::error::an incomplete ESA config was not rejected with a clear message"
+            exit 1
+          fi
